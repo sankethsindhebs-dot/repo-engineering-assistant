@@ -1,0 +1,21 @@
+services:
+  neo4j:
+    image: neo4j:5.26.30-community
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in your local .env}"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'NEO4J_PASSWORD="$${NEO4J_AUTH#*/}" cypher-shell -a bolt://localhost:7687 -u neo4j "RETURN 1;" >/dev/null 2>&1'
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  neo4j_data:
