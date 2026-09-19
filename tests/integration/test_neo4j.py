@@ -47,6 +47,8 @@ class Neo4jIntegrationTests(unittest.TestCase):
 
     def cleanup_graph(self):
         # No blanket DELETE: cleanup is restricted to IDs allocated by this test.
+        self.query("MATCH (n:Chunk) WHERE n.repository_id IN $ids DETACH DELETE n", ids=self.repository_ids)
+        self.query("MATCH (n:Document) WHERE n.repository_id IN $ids DETACH DELETE n", ids=self.repository_ids)
         self.query("MATCH (n:Entity) WHERE n.repository_id IN $ids DETACH DELETE n", ids=self.repository_ids)
         self.query("MATCH (n:IngestionState) WHERE n.repository_id IN $ids DELETE n", ids=self.repository_ids)
 

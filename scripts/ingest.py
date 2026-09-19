@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from backend.config import Settings
 from backend.graph.store import GraphWriteError, write_snapshot
+from backend.ingestion.documents import read_documents
 from backend.ingestion.repository import IngestionError, parse_repository
 
 
@@ -26,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         snapshot = parse_repository(args.repository, args.repository_id, args.source_root)
+        documents = read_documents(args.repository, args.repository_id)
         if args.dry_run:
             result = {
                 "mode": "parse_only", "repository_id": snapshot.repository_id,
@@ -34,9 +36,11 @@ def main(argv: list[str] | None = None) -> int:
                 "unresolved_references": sum(ref.target_id is None for ref in snapshot.references),
             }
         else:
-            result = asdict(write_snapshot(Settings(), snapshot, args.timeout_seconds))
+            result = asdict(write_snapshot(Settings(), snapshot, args.timeout_seconds, documents=documents))
             result["mode"] = "persisted"
         result["skipped_paths"] = snapshot.skipped_paths
+        result["documents"] = len(documents.items)
+        result["documentation_hash"] = documents.digest
         print(json.dumps(result, sort_keys=True))
         return 0
     except (IngestionError, GraphWriteError, ValidationError, ValueError) as exc:

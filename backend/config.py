@@ -1,4 +1,4 @@
-"""Phase 0 settings. Provider selection remains an explicit local experiment."""
+"""Typed local service configuration; model capabilities are independently selected."""
 
 from pathlib import Path
 from typing import Literal
@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     model_generation_model: str | None = None
     model_embedding_model: str | None = None
     model_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    retrieval_chunk_bytes: int = Field(default=1536, ge=256, le=16384)
+    embedding_batch_size: int = Field(default=8, ge=1, le=32)
 
     @field_validator("neo4j_uri")
     @classmethod
@@ -82,7 +84,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_provider_selection(self) -> "Settings":
         if self.model_provider == "ollama":
+            if not (self.model_generation_model or self.model_embedding_model):
+                raise ValueError("Configure at least one local model capability")
             for name in (self.model_generation_model, self.model_embedding_model):
-                if not name or not name.strip() or name.endswith(":cloud"):
-                    raise ValueError("Explicit local generation and embedding model names are required")
+                if name is not None and (not name.strip() or name != name.strip() or name.endswith(":cloud")):
+                    raise ValueError("Configured model names must identify explicit local models")
         return self

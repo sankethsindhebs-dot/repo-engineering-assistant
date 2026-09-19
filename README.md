@@ -1,8 +1,10 @@
 # Repo Engineering Assistant
 
-Phase 0 service foundation plus Phase 1A deterministic Python AST ingestion and
-structural Neo4j persistence. GraphRAG, agent execution, generated tools, SSE activity
-and the frontend are not implemented.
+Phase 0 services, Phase 1A deterministic Python AST ingestion, and Phase 1B internal
+GraphRAG retrieval. Retrieval combines source/document seeds with bounded traversal
+of the stored structural graph and returns evidence with provenance. Agent execution,
+public agent tools, generated tools, answer generation, SSE and the frontend remain
+outside this implementation.
 
 ## Local prerequisites
 
@@ -52,8 +54,9 @@ endpoint runs a model. Model feasibility is assessed separately by preflight.
 The official [5.26 release archive](https://neo4j.com/release-notes/database/)
 listed [5.26.30](https://neo4j.com/release-notes/database/neo4j-5-26-30/),
 released 26 August 2026, as the latest 5.26 patch checked on 18 September 2026.
-Compose pins `neo4j:5.26.30-community`. Phase 1A adds only the structural schema
-described below. No APOC/GDS, vector index or Neo4j 2026/Cypher 25 functionality is introduced.
+Compose pins `neo4j:5.26.30-community`. Phase 1A adds the structural schema below;
+Phase 1B adds evidence and a native vector index. Neither phase uses APOC/GDS or
+Neo4j 2026/Cypher 25 functionality.
 
 Neo4j 5.26.30 is the pinned database server; neo4j==5.28.6 is the separate Python client driver and is compatible with Neo4j 5.x servers.
 
@@ -76,8 +79,10 @@ In your private `.env`, set `MODEL_PROVIDER=ollama`,
 The older `7b` example remains a candidate for other hardware; the development
 laptop with 7.6 GB RAM verified `3b` with Ollama 0.34.2. This is a configuration
 choice, with no change to the provider boundary. Keep the loopback base URL.
-No hosted fallback exists. The adapter talks to `/api/chat` and `/api/embed`;
-it does not require an agent framework or the Ollama SDK.
+No hosted fallback exists. The adapter uses `/api/chat`, `/api/embed` and
+`/api/tags` for embedding-model identity; it needs neither an agent framework nor
+the Ollama SDK. Retrieval/indexing can use an embedding-only configuration. The
+Phase 0 `models` preflight still exercises both generation and embedding.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\preflight.py --checks models
@@ -109,7 +114,8 @@ Preflight exit codes: `0` = selected checks passed; `1` = a selected check faile
 sign-off. Docker configuration acceptance also does not prove container startup.
 
 Configuration is loaded from the repository-root `.env`; environment variables take
-precedence. Timeouts must be positive. Model names must be explicit when enabled.
+precedence. Timeouts must be positive. At least one model capability must be named
+when enabled; each operation checks that its own model is configured.
 Credentials are separate from URIs and errors suppress input/server response values.
 
 ## Troubleshooting and boundaries
@@ -156,7 +162,8 @@ its JSON output reports `mode: persisted` only after commit. The fixture produce
 12 entities, 19 relationships and 4 unresolved references. No HTTP ingestion route
 is added. The Phase 0 readiness/probe path remains read-only.
 
-Only `.py` files beneath the source root are selected. Symlinks are not followed.
+Python analysis selects `.py` files beneath the source root. Phase 1B also scans
+repository-root documentation independently, as described below. Symlinks are not followed.
 Directories named `.git`, `.venv`, `venv`, `__pycache__`, `node_modules`, `build` and
 `dist` are excluded. Skipped paths are reported. This does not implement `.gitignore`
 rules. Use a source root that contains the code you intend to ingest. Empty source
@@ -219,7 +226,8 @@ invented. `references_json` is evidence storage, not a graph relationship.
 The writer creates two uniqueness constraints: `Entity.id` and
 `IngestionState.repository_id`; one range index on `Entity.repository_id` supports
 scoped replacement. Neo4j also supplies the constraints' backing indexes. There are
-no relationship indexes, vector indexes or plugins. A version check requires
+no structural relationship indexes or plugins. Phase 1B's evidence/vector schema
+is additive. A version check requires
 Neo4j 5.26.30. Schema setup is idempotent and separate from data writes. A single
 transaction locks the repository metadata record, deletes only that repository's
 entities, recreates the validated snapshot and updates its hash. Failure rolls the
@@ -273,4 +281,236 @@ Remove-Item Env:PHASE1A_NEO4J_TESTS
 Live tests cover labels/evidence, a stored local call chain, repeated ingestion,
 changed snapshots, repository isolation, malformed input, transaction rollback,
 concurrent first ingestion and the CLI. Offline tests are not evidence of database
-persistence. No Phase 1B retrieval or later functionality is included.
+persistence. Phase 1B's separate integration coverage is described below.
+
+## Phase 1B: internal evidence retrieval
+
+### Indexing and additive upgrade
+
+For an existing Phase 1A repository in Neo4j, run the indexing command directly
+against its unchanged checkout and the same logical repository ID. It verifies
+the stored Python snapshot, adds retrieval metadata, documents and chunks, and
+preserves existing structural nodes, relationships and `references_json`. No volume
+reset or ingestion of unrelated repositories is needed. If Python source differs,
+run structural ingestion first. The indexer obtains `source_root` from stored state.
+
+Enable `MODEL_PROVIDER=ollama` and `MODEL_EMBEDDING_MODEL=nomic-embed-text` in your
+private configuration. Generation may remain unset. Native Ollama stays outside
+Compose. With the embedding model already pulled, the complete new-repository
+workflow is:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\ingest.py tests\fixtures\retrieval_repo --repository-id retrieval-demo
+.\.venv\Scripts\python.exe scripts\index_repository.py --repository tests\fixtures\retrieval_repo --repository-id retrieval-demo
+.\.venv\Scripts\python.exe scripts\index_repository.py --repository tests\fixtures\retrieval_repo --repository-id retrieval-demo
+```
+
+The second unchanged indexing run reports `embedded: 0`; identity checks still
+contact the provider. Structural ingestion never contacts a model. Indexing reads
+and rechecks the checkout before publication; use a stable checkout throughout.
+The CLI emits `READY` only after successful publication or verified compatible reuse.
+
+### Source and documentation evidence
+
+Python chunks belong to existing Function, Method, Class or Module/File entities.
+A parent owns only the lines outside its direct child declarations, so declaration
+bodies are not repeatedly embedded in every ancestor. Regions are contiguous and
+line-aligned; blank boundary lines do not create standalone chunks. Empty owners
+can be exact seeds without invented source evidence.
+
+Documentation discovery starts at the repository root, irrespective of Python's
+source root. It includes case-insensitive `.md`, extensionless `README` and
+`README.txt`, using the same excluded directory names and no symlink traversal.
+UTF-8/BOM input is normalized to LF; invalid encoding/NUL fails explicitly.
+Markdown uses ATX headings outside backtick/tilde fenced blocks. Fenced text stays
+source evidence; Markdown links and code examples create no structural edges.
+Plain README files use line-aligned splitting. This is not a full Markdown parser.
+
+`Document` is separate from `Entity`, `File` and `Module`. Its ID hashes a versioned
+prefix, repository ID and relative path. `Chunk` stores owner discrimination,
+owner/entity/document IDs, path, kind/name where applicable, actual line span, exact
+normalized text, text hash, original-file hash, embedding-input hash and policy ID.
+Chunk IDs hash repository, owner, policy, owned-region ordinal and split ordinal.
+They are deterministic across machines; changed region/split layout can change IDs.
+Text changes can keep an ID while changing its input hash. Original-file hashes
+can change without requiring re-embedding unchanged normalized input.
+
+`RETRIEVAL_CHUNK_BYTES` defaults to 1536 UTF-8 bytes, including owner/path metadata
+and the `search_document: ` prefix. Whole physical lines are split into bounded
+units. An overlong individual line/header fails; nothing is silently truncated.
+The budget is not a tokenizer estimate or a guarantee of model context acceptance.
+Ollama receives `truncate: false`. Query input uses `search_query: ` with the same
+input-byte ceiling. Input format, prefixes and chunk policy are versioned.
+
+### Evidence schema and embedding publication
+
+| Addition | Purpose |
+| --- | --- |
+| `Document` | Repository-scoped documentation source, format, lines and original hash. |
+| `Chunk` | Exact source evidence plus the current/cached vector and profile metadata. |
+| `Chunk-[:EVIDENCE_FOR]->Entity/Document` | One deterministic owner link; not a structural traversal edge. |
+| `IngestionState` properties | Current/published source and documentation identities, revisions, profile, state and attempt token. |
+
+There are unique constraints on `Chunk.id` and `Document.id`, and repository range
+indexes for each. Existing structural constraints remain. Schema setup is
+idempotent and separate from transactional data publication.
+
+Each repository has one label `REA_Evidence_v1_<repository-hash>` and one native
+index `rea_evidence_vec_v1_<repository-hash>` on `embedding`, with 768 dimensions
+and cosine similarity. Setup uses `CREATE VECTOR INDEX ... IF NOT EXISTS`, then
+checks the actual label, property, dimension, metric and `ONLINE` state. An
+incompatible existing index is rejected, never silently replaced. Native queries
+use `db.index.vector.queryNodes()`; see the
+[Neo4j vector-index manual](https://neo4j.com/docs/cypher-manual/5/indexes/semantic-indexes/vector-indexes/).
+Candidate search is approximate. The query requests `min(400, max(20, 4*k))`
+candidates, applies current-state guards and stable score/ID ordering, then returns
+at most `k`. This improves the observed small-candidate fixture behavior without
+claiming exhaustive nearest neighbors or guaranteed recall.
+
+The profile hashes provider, normalized model name, model digest, 768 dimensions,
+prefix policy, chunk policy and input-format version. This first retrieval profile
+requires local `nomic-embed-text`; another model/profile must be explicitly designed,
+not silently substituted. `/api/tags` must provide a valid digest. Batches default
+to eight inputs (`EMBEDDING_BATCH_SIZE`), with responses associated by input position.
+Every batch must have the right count, 768 finite values per vector and a nonzero norm;
+vectors are never padded or shortened. A positional API cannot independently detect
+a server that silently swaps correctly shaped outputs. Tests verify our association.
+
+Model requests run outside data transactions. Publication takes the existing
+repository write lock, verifies captured revision/hash/attempt identities, and
+atomically replaces the complete vector/profile state. Failed publication rolls
+back; an obsolete attempt cannot publish or fail a newer attempt. Compatible
+unchanged input hashes reuse stored vectors. Changed/deleted/renamed sources
+reconcile current chunks and delete stale chunks/links; retained old vectors are
+cache data until complete publication succeeds.
+
+Same-schema profile changes reuse the single index and label, overwriting cached
+profiles on successful publication. No per-profile index, label or history grows;
+failure retains at most the old cache. No application path drops indexes. Index
+lifecycle is one per logical repository for vector schema v1, including repositories
+whose files are later removed; repository/index deletion is not an automated feature.
+Unrelated indexes are untouched.
+
+### Effective semantic readiness
+
+| State | Meaning and permitted retrieval |
+| --- | --- |
+| `UNINDEXED` | Missing retrieval metadata/publication. Current exact/lexical/graph evidence may be used. |
+| `DIRTY` | Source, documentation, policy or requested profile differs from publication. Semantic evidence is withheld. |
+| `BUILDING` | An attempt is generating vectors outside database transactions. Semantic evidence is withheld. |
+| `READY` | Current/published source revision, structural hash, documentation hash/freshness and profile agree; index is compatible and online. |
+| `FAILED` | An indexing attempt failed or the current vector request is unavailable. Semantic evidence is withheld; diagnostics explain request-level failures. |
+
+A stored `READY` string alone is insufficient. Vector lookup checks publication
+identities again in Cypher and checks the repository revision before/after reads.
+An application-managed concurrent change causes one bounded retry, then an explicit
+failure if revisions keep changing. Provider identity is checked before and after
+query embedding; no model fallback occurs. Exact-only requests report readiness of
+the published profile without contacting the provider.
+
+After source change and structural ingestion, current source evidence is available
+while semantic retrieval remains not ready until re-indexing completes. Calling the
+low-level structural writer without a documentation snapshot marks documentation
+`needs_refresh`; retained documentation cannot appear as current evidence. The CLI
+ingestion scans both source and docs. Indexing can refresh documentation alone.
+Filesystem edits become visible when these commands run: there is no filesystem
+watcher. Queries are grounded in the captured database snapshot, not unscanned disk.
+An interrupted attempt may remain `BUILDING`; rerun indexing to supersede it.
+
+### Internal request, traversal and provenance
+
+Use the internal Python entry point; no HTTP retrieval endpoint or public agent tool
+is introduced. For example, after configuring Neo4j:
+
+```python
+import asyncio
+from backend.config import Settings
+from backend.retrieval.models import RetrievalRequest, TraversalProfile, TraversalStep
+from backend.retrieval.retrieve import retrieve
+
+request = RetrievalRequest(
+    repository_id="retrieval-demo", query="worker.transform", channels=("exact",),
+    traversal=TraversalProfile(steps=(TraversalStep(relationship="CALLS", direction="incoming"),)),
+)
+result = asyncio.run(retrieve(Settings(), request))
+print(result.model_dump_json(indent=2))
+```
+
+Exact matching uses qualified name, normalized relative path and symbol name;
+ambiguous short names retain distinct candidates within the seed limit. Lexical
+matching counts shared source/path/identifier terms, including snake/camel parts.
+It is a repository-scoped in-memory scan. Vector hits map chunks to their owner.
+Each owner receives one rank per channel; direct fusion sums `1/(60 + rank)` with
+exact precedence and fixed ties. Raw scores/ranks and matching chunk IDs remain
+visible. Vector similarity is not answer confidence. Graph discoveries do not
+receive a fabricated semantic score.
+
+Every structural relationship supports outgoing and incoming traversal. Requests
+choose explicit relationship/direction pairs; no natural-language inference occurs.
+Defaults use outgoing CALLS, IMPORTS, INHERITS and CONTAINS, plus terminal incoming
+CONTAINS parent context. Incoming CALLS finds callers, IMPORTS finds dependent
+owners, and INHERITS finds derived classes. No reverse relationships are stored.
+`parent_context="ascend"` explicitly permits continued parent traversal.
+
+BFS defaults: 5 seeds, depth 2, 40 admitted entities including roots, 80 examined
+relationship rows including duplicates/cycles, and 12 rows per expanded entity.
+Validated hard ceilings are 20/6/200/1000/100 respectively. Relationship priority is
+CALLS, INHERITS, IMPORTS, CONTAINS; outgoing precedes incoming, then target/edge IDs.
+Each entity is expanded once; all distinct encountered provenance paths are kept,
+including parallel call sites. This is bounded discovery, not enumeration of every
+possible graph path. Documentation seeds never enter structural expansion.
+
+Only stored structural edges can be traversed. Unresolved `references_json` entries
+produce diagnostics, never guessed targets. Up to 100 unresolved records are
+returned; expressions longer than 512 characters are explicitly marked truncated.
+Graph provenance preserves seed, hop count, ordered entity path, stored relationship
+ID/type/endpoints, followed direction, and reference expression/path/coordinates.
+Source spans refer to exact returned text; AST columns retain UTF-8 byte semantics.
+
+Defaults reserve up to 10 direct and 10 graph evidence chunks, two chunks per owner,
+and 32 KiB of source text. Evidence is deduplicated by chunk ID without discarding
+encountered direct/graph origins. Graph evidence orders by seed rank, hop distance
+and stable ID. Source budgets skip complete chunks with diagnostics. Bounds indicate
+that a cap was reached, not proof that more neighbors exist. A 15-second request
+deadline and database query timeouts limit work; timeout/connection errors fail
+explicitly. Whole-repository reads and in-memory processing target small local
+repositories, not hard real-time or production-scale service guarantees.
+
+### Phase 1B verification
+
+The offline command in the earlier section includes all source, document, model
+schema, traversal and existing regression tests. Real database tests are separate:
+
+```powershell
+$env:PHASE1A_NEO4J_TESTS = "1"
+$env:PHASE1B_NEO4J_TESTS = "1"
+.\.venv\Scripts\python.exe -m unittest discover -s tests/integration -v
+Remove-Item Env:PHASE1A_NEO4J_TESTS
+Remove-Item Env:PHASE1B_NEO4J_TESTS
+```
+
+These tests use deterministic test embeddings in a real Neo4j vector index.
+They prove source/vector persistence, retrieval and traversal causality, not a
+real model's relevance quality. The fixture's entry-point evidence omits the
+downstream `casefold` implementation with graph disabled, discovers it through CALLS
+with graph enabled, and loses it when that stored edge is removed. Equivalent tests
+cover lexical seeds, reverse directions, inheritance/dependency edge intervention,
+unresolved callbacks, bounds, source/doc updates, rollback and additive upgrade.
+Tests create unique repository IDs and remove only their own data/vector indexes;
+shared schema remains. They never call a generation model.
+
+For the separately gated real local embedding check, keep native Ollama running
+with `nomic-embed-text` installed and run:
+
+```powershell
+$env:PHASE1B_NEO4J_TESTS = "1"
+$env:PHASE1B_OLLAMA_TESTS = "1"
+.\.venv\Scripts\python.exe -m unittest discover -s tests/integration -p test_retrieval.py -k test_real_ollama -v
+Remove-Item Env:PHASE1B_NEO4J_TESTS
+Remove-Item Env:PHASE1B_OLLAMA_TESTS
+```
+
+No agent loop, public `search_repository`/`traverse_graph`/`read_evidence` tools,
+runtime code generation, generated-code execution, SCC tooling, SSE, frontend,
+Mermaid rendering or final answer generation is part of Phase 1B. Static-analysis
+limits above continue to apply to every retrieved path.

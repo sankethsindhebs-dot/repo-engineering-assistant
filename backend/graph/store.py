@@ -8,6 +8,7 @@ from neo4j import GraphDatabase, ManagedTransaction, Query, unit_of_work
 from neo4j.exceptions import DriverError, Neo4jError
 
 from backend.config import NEO4J_VERSION, Settings
+from backend.ingestion.documents import Documents
 from backend.ingestion.models import Snapshot
 
 
@@ -33,14 +34,16 @@ class WriteResult:
     unresolved_references: int
 
 
-def _replace_snapshot(tx: ManagedTransaction, snapshot: Snapshot) -> None:
+def _replace_snapshot(tx: ManagedTransaction, snapshot: Snapshot, documents: Documents | None = None,
+                      chunk_bytes: int = 1536) -> None:
+    from backend.graph.evidence_store import reconcile_evidence
     parameters = {"repository_id": snapshot.repository_id}
     # SET obtains a write lock on the one metadata node before reading/deleting
     # entities. The uniqueness constraint also serializes first-time ingestion.
-    tx.run(
+    previous = tx.run(
         "MERGE (s:IngestionState {repository_id: $repository_id}) "
-        "SET s.lock_version = coalesce(s.lock_version, 0) + 1", **parameters,
-    ).consume()
+        "SET s.lock_version = coalesce(s.lock_version, 0) + 1 RETURN properties(s) AS state", **parameters,
+    ).single(strict=True)["state"]
     tx.run("MATCH (n:Entity {repository_id: $repository_id}) DETACH DELETE n", **parameters).consume()
     references = defaultdict(list)
     for reference in snapshot.references:
@@ -85,9 +88,12 @@ def _replace_snapshot(tx: ManagedTransaction, snapshot: Snapshot) -> None:
         **parameters, digest=snapshot.digest, source_root=snapshot.source_root,
         skipped_paths=list(snapshot.skipped_paths),
     ).consume()
+    reconcile_evidence(tx, snapshot, documents, chunk_bytes, previous)
 
 
-def write_snapshot(settings: Settings, snapshot: Snapshot, timeout_seconds: float = 60) -> WriteResult:
+def write_snapshot(settings: Settings, snapshot: Snapshot, timeout_seconds: float = 60,
+                   *, documents: Documents | None = None) -> WriteResult:
+    from backend.graph.evidence_store import EvidenceStoreError, RETRIEVAL_SCHEMA
     snapshot.validate()
     if not 0 < timeout_seconds <= 600:
         raise ValueError("Ingestion timeout must be greater than zero and at most 600 seconds")
@@ -109,14 +115,14 @@ def write_snapshot(settings: Settings, snapshot: Snapshot, timeout_seconds: floa
                 if record["version"] != NEO4J_VERSION:
                     raise GraphWriteError(f"Ingestion requires Neo4j {NEO4J_VERSION}")
                 # Neo4j schema commands run separately from the atomic data transaction.
-                for statement in SCHEMA:
+                for statement in (*SCHEMA, *RETRIEVAL_SCHEMA):
                     session.run(Query(statement, timeout=timeout_seconds)).consume()
                 @unit_of_work(timeout=timeout_seconds)
                 def work(tx: ManagedTransaction) -> None:
-                    _replace_snapshot(tx, snapshot)
+                    _replace_snapshot(tx, snapshot, documents, settings.retrieval_chunk_bytes)
 
                 session.execute_write(work)
-    except (DriverError, Neo4jError, OSError) as exc:
+    except (DriverError, Neo4jError, OSError, EvidenceStoreError, ValueError) as exc:
         raise GraphWriteError(f"Neo4j ingestion failed ({type(exc).__name__}); inspect or retry the snapshot") from None
     return WriteResult(snapshot.repository_id, snapshot.digest, len(snapshot.entities),
                        len(snapshot.relationships), sum(ref.target_id is None for ref in snapshot.references))

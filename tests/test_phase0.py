@@ -64,9 +64,17 @@ class ConfigurationTests(CleanEnvironment):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 Settings(_env_file=None, neo4j_timeout_seconds=value)
 
-    def test_provider_requires_both_model_names(self):
+    def test_provider_requires_a_configured_capability(self):
         with self.assertRaises(ValidationError):
             Settings(_env_file=None, model_provider="ollama")
+
+    def test_embedding_only_configuration(self):
+        settings = Settings(_env_file=None, model_provider="ollama", model_embedding_model="nomic-embed-text")
+        self.assertIsNone(settings.model_generation_model)
+
+    def test_generation_only_configuration(self):
+        settings = Settings(_env_file=None, model_provider="ollama", model_generation_model="candidate-code:3b")
+        self.assertIsNone(settings.model_embedding_model)
 
     def test_remote_or_credentialed_model_endpoint_rejected(self):
         for url in ("https://example.com", "http://user:private@127.0.0.1", "http://127.0.0.1/api"):
